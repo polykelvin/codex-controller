@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Local configuration and usage only. Never calls an inference API."""
 import argparse
+from contextlib import closing
 import datetime as dt
 import hashlib
 import json
 import os
 from pathlib import Path
 import re
+import sqlite3
 import sys
 import tempfile
 import uuid
@@ -343,6 +345,7 @@ class Controller:
         days = {}
         periods = {k: empty_totals() for k in ("today", "week", "month", "all")}
         providers = {}
+        models = {k: {} for k in periods}
         for row in all_rows:
             try:
                 date = dt.datetime.fromisoformat(row["timestamp"].replace("Z", "+00:00")).astimezone(hkt).date()
@@ -353,6 +356,8 @@ class Controller:
             for period, start in (("today", today), ("week", week), ("month", month), ("all", dt.date.min)):
                 if date >= start:
                     add_usage(periods[period], row)
+                    model = row.get("model") or "unknown"
+                    add_usage(models[period].setdefault(model, empty_totals()), row)
             if date >= month:
                 provider = row.get("provider") or "unknown"
                 add_usage(providers.setdefault(provider, empty_totals()), row)
@@ -362,7 +367,7 @@ class Controller:
         for i in range(13, -1, -1):
             d = today - dt.timedelta(days=i)
             day_rows.append({"date": d.isoformat(), **days.get(d.isoformat(), empty_totals())})
-        return {"periods": periods, "providers_month": providers, "days": day_rows,
+        return {"periods": periods, "models": models, "providers_month": providers, "days": day_rows,
                 "profile_id": profile_id, "profile_name": profile["name"] if profile else "All profiles",
                 "files": len(files), "unreadable_files": errors, "approximate_records": len(fallback),
                 "timezone": "Asia/Hong_Kong", "updated": now.isoformat(),
@@ -375,11 +380,12 @@ class Controller:
             root = self.home / folder
             if root.exists():
                 files.extend(root.rglob("*.jsonl"))
+        titles = read_session_titles(self.home)
         sessions = []
         chosen = None
         for path in sorted(files, key=lambda p: p.stat().st_mtime, reverse=True):
             identity = hashlib.sha256(str(path.relative_to(self.home)).encode()).hexdigest()[:24]
-            provider, model, title, started = "unknown", "", "", ""
+            provider, model, title, started, thread_id = "unknown", "", "", "", ""
             try:
                 # Session metadata and the first user message appear near the start.
                 with path.open() as f:
@@ -393,17 +399,21 @@ class Controller:
                         payload = record.get("payload") or {}
                         kind = record.get("type")
                         if kind == "session_meta":
+                            thread_id = payload.get("id") or thread_id
                             provider = payload.get("model_provider") or provider
                             started = record.get("timestamp", "")
                         elif kind == "turn_context":
                             model = payload.get("model", model)
                         elif kind == "event_msg" and payload.get("type") == "user_message" and not title:
-                            title = str(payload.get("message", ""))[:150]
+                            title = str(payload.get("message", ""))[:300]
+                        elif kind == "response_item" and payload.get("type") == "message" and payload.get("role") == "user" and not title:
+                            title = display_text(payload.get("content", []), limit=300)
                 if accepted is not None and provider not in accepted:
                     continue
                 if identity == session_id:
                     chosen = path
-                sessions.append({"id": identity, "title": title or "Codex session", "provider": provider,
+                title = titles.get(thread_id) or " ".join(title.split()) or "Session " + (thread_id or identity)[:8]
+                sessions.append({"id": identity, "thread_id": thread_id, "title": title, "provider": provider,
                                  "model": model, "started": started, "modified": path.stat().st_mtime})
             except (OSError, ValueError):
                 continue
@@ -415,6 +425,41 @@ class Controller:
             chosen = next((p for p in files if hashlib.sha256(str(p.relative_to(self.home)).encode()).hexdigest()[:24] == identity), None)
         events = read_activity_file(chosen) if chosen else []
         return {"sessions": sessions, "session_id": session_id or (sessions[0]["id"] if sessions else None), "events": events}
+
+
+def read_session_titles(home):
+    """Read Codex's saved titles without changing its database or persisting text."""
+    titles = {}
+    for path in sorted(home.glob("state_*.sqlite"), key=lambda p: int(p.stem.split("_")[-1]) if p.stem.split("_")[-1].isdigit() else -1, reverse=True):
+        try:
+            with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True, timeout=0.2)) as connection:
+                columns = {r[1] for r in connection.execute("PRAGMA table_info(threads)")}
+                if not {"id", "title"}.issubset(columns):
+                    continue
+                query = "SELECT id, COALESCE(NULLIF(name, ''), title) FROM threads" if "name" in columns else "SELECT id, title FROM threads"
+                for identity, title in connection.execute(query):
+                    if isinstance(title, str) and title.strip():
+                        titles.setdefault(identity, " ".join(title.split()))
+        except (OSError, sqlite3.Error):
+            continue
+    # The append-only index records explicit thread names and renames.
+    indexed = {}
+    try:
+        with (home / "session_index.jsonl").open() as source:
+            for line in source:
+                try:
+                    row = json.loads(line)
+                    identity, title = row.get("id"), row.get("thread_name")
+                    stamp = row.get("updated_at") or ""
+                    if isinstance(identity, str) and isinstance(title, str) and title.strip():
+                        if identity not in indexed or stamp >= indexed[identity][0]:
+                            indexed[identity] = (stamp, " ".join(title.split()))
+                except (ValueError, AttributeError, TypeError):
+                    continue
+    except OSError:
+        pass
+    titles.update({identity: value[1] for identity, value in indexed.items()})
+    return titles
 
 
 def empty_totals():

@@ -30,7 +30,7 @@ for index, profile in enumerate(profiles):
         date = today - dt.timedelta(days=13-day)
         stamp = date.isoformat() + "T04:30:00Z"
         lines.append({"type": "session_meta", "timestamp": stamp, "payload": {"id": f"demo-{index}", "model_provider": provider}})
-        lines.append({"type": "turn_context", "timestamp": stamp, "payload": {"model": "coding-model"}})
+        lines.append({"type": "turn_context", "timestamp": stamp, "payload": {"model": "coding-model" if day % 3 else "reasoning-model"}})
         amount = [35000, 52000, 28000, 76000, 41000, 64000, 90000, 47000, 81000, 60000, 98000, 72000, 54000, 88000][day] * (index+1)
         lines.append({"type": "token_usage_record", "timestamp": stamp, "payload": {"response_id": f"demo-{index}-{day}", "usage": {
             "input_tokens": amount, "cached_input_tokens": amount//2, "output_tokens": amount//8, "total_tokens": amount+amount//8}}})

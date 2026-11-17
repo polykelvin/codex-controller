@@ -16,7 +16,10 @@ browse local Codex activity.
   Codex app reopens with the selected configuration.
 - **Token activity:** daily, weekly and monthly totals, input/cached/output
   breakdowns, and a 14-day chart. View one profile or all profiles together.
-- **Activity viewer:** browse recent sessions, tool calls, commands, results,
+- **Usage by model:** compare exact input, cached input, output and total tokens
+  plus request counts for today, this week, this month or all time.
+- **Activity viewer:** find sessions by their saved conversation titles (including
+  renamed chats), then browse tool calls, commands, results,
   assistant messages and recorded reasoning summaries.
 - **Native credentials:** one macOS Keychain entry per Azure profile.
 - **Gentle color:** a soft moving wave follows the selected profile, respects
@@ -81,6 +84,9 @@ Totals come from local `sessions` and `archived_sessions` records. Response IDs
 are deduplicated, and older logs use cumulative-counter differences. Cached
 input is part of input; reasoning tokens are not added to output twice.
 
+- Model names come from recorded turn context (Azure may show a deployment name).
+  Missing model metadata appears as **Unknown model**. Models with the same name
+  are combined when viewing all profiles.
 - Days use Hong Kong time; weeks start Monday.
 - These are recorded tokens, not remaining subscription allowance or an Azure
   invoice. Other devices, deleted records and unrecorded activity are not covered.

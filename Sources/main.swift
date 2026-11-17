@@ -488,8 +488,8 @@ final class ActivityWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
             scroll.widthAnchor.constraint(equalToConstant: width).isActive = true
             return scroll
         }
-        let sessionsView = tableScroll(sessionsTable, width: 225)
-        let eventsView = tableScroll(eventsTable, width: 260)
+        let sessionsView = tableScroll(sessionsTable, width: 280)
+        let eventsView = tableScroll(eventsTable, width: 240)
         let detailView = NSScrollView()
         detailView.hasVerticalScroller = true
         detailView.borderType = .bezelBorder
@@ -575,6 +575,7 @@ final class ActivityWindow: NSObject, NSTableViewDataSource, NSTableViewDelegate
         let text = label(title.replacingOccurrences(of: "\n", with: " ") + "\n" + String(suffix.prefix(19)).replacingOccurrences(of: "T", with: " "), size: 11)
         text.maximumNumberOfLines = 2; text.lineBreakMode = .byTruncatingTail
         let cell = NSTableCellView(); cell.addSubview(text); cell.textField = text
+        cell.toolTip = title + "\n" + suffix + (tableView === sessionsTable ? "\n" + (data[row]["thread_id"] as? String ?? "") : "")
         text.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([text.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 8), text.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -8), text.centerYAnchor.constraint(equalTo: cell.centerYAnchor)])
         return cell
@@ -611,6 +612,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var profileNote = label("", size: 11, color: .secondaryLabelColor)
     var usageTitle = label("Token activity", size: 16, weight: .semibold)
     var usageScope = NSSegmentedControl(labels: ["This profile", "All profiles"], trackingMode: .selectOne, target: nil, action: nil)
+    var modelPeriod = NSSegmentedControl(labels: ["Today", "Week", "Month", "All time"], trackingMode: .selectOne, target: nil, action: nil)
+    var modelRows = stack(.vertical, [], spacing: 8)
+    var modelUsage: [String: [String: [String: Any]]] = [:]
     var usageRequest = 0
     var editor: ProfileEditor?
     var endpoint = NSTextField(string: "")
@@ -669,7 +673,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func buildWindow() {
         window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1010, height: 880),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
-        window.title = "Codex Controller"
+        window.title = demoMode ? "Codex Controller Demo" : "Codex Controller"
         window.minSize = NSSize(width: 880, height: 650)
         window.center()
         window.isReleasedWhenClosed = false
@@ -677,7 +681,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         content.wantsLayer = true
         content.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
 
-        let title = label("Codex Controller", size: 27, weight: .bold)
+        let title = label(demoMode ? "Codex Controller Demo" : "Codex Controller", size: 27, weight: .bold)
         wave.motion = true
         let settingsButton = NSButton(image: NSImage(systemSymbolName: "gearshape", accessibilityDescription: "Profile settings")!, target: self, action: #selector(showSettings))
         settingsButton.toolTip = "Profile settings"
@@ -751,8 +755,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             cards.addArrangedSubview(box)
         }
         let scope = label("Hong Kong time · Week starts Monday", size: 10, color: .secondaryLabelColor)
-        let usageContent = stack(.vertical, [usageHeader, cards, chart, providerBreakdown, scope], spacing: 12)
-        for v in [usageHeader, cards, chart, providerBreakdown, scope] { v.widthAnchor.constraint(equalTo: usageContent.widthAnchor).isActive = true }
+        modelPeriod.selectedSegment = 2
+        modelPeriod.target = self
+        modelPeriod.action = #selector(modelPeriodChanged)
+        let modelHeader = stack(.horizontal, [label("Usage by model", size: 14, weight: .semibold), flexibleSpace(), modelPeriod])
+        let modelScroll = NSScrollView()
+        modelScroll.translatesAutoresizingMaskIntoConstraints = false
+        modelScroll.hasVerticalScroller = true
+        modelScroll.drawsBackground = false
+        let modelDocument = FlippedView()
+        modelDocument.translatesAutoresizingMaskIntoConstraints = false
+        modelScroll.documentView = modelDocument
+        modelRows.translatesAutoresizingMaskIntoConstraints = false
+        modelDocument.addSubview(modelRows)
+        NSLayoutConstraint.activate([
+            modelScroll.heightAnchor.constraint(equalToConstant: 150),
+            modelDocument.widthAnchor.constraint(equalTo: modelScroll.contentView.widthAnchor),
+            modelRows.leadingAnchor.constraint(equalTo: modelDocument.leadingAnchor),
+            modelRows.trailingAnchor.constraint(equalTo: modelDocument.trailingAnchor, constant: -14),
+            modelRows.topAnchor.constraint(equalTo: modelDocument.topAnchor, constant: 4),
+            modelRows.bottomAnchor.constraint(equalTo: modelDocument.bottomAnchor, constant: -4)
+        ])
+        renderModelUsage()
+        let usageContent = stack(.vertical, [usageHeader, cards, chart, providerBreakdown, modelHeader, modelScroll, scope], spacing: 12)
+        for v in [usageHeader, cards, chart, providerBreakdown, modelHeader, modelScroll, scope] { v.widthAnchor.constraint(equalTo: usageContent.widthAnchor).isActive = true }
         chart.heightAnchor.constraint(equalToConstant: 120).isActive = true
         let usagePanel = Panel(usageContent)
 
@@ -857,6 +883,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         metricLabels.values.forEach { $0.stringValue = "—" }
         metricDetails.values.forEach { $0.stringValue = "Loading…" }
         chart.days = []
+        modelUsage = [:]
+        renderModelUsage(loading: true)
         providerBreakdown.stringValue = all ? "Loading all profiles…" : "Loading \(selectedProfile?.name ?? "profile")…"
         backend(["usage"] + (all ? [] : ["--profile-id", requestedProfile])) { result in
             guard self.usageRequest == requestID else { return }
@@ -869,6 +897,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.metricLabels[key]?.stringValue = self.compact(p["total"])
                     self.metricDetails[key]?.stringValue = "In \(self.compact(p["input"])) · Cached \(self.compact(p["cached"])) · Out \(self.compact(p["output"]))"
                 }
+                self.modelUsage = data["models"] as? [String: [String: [String: Any]]] ?? [:]
+                self.renderModelUsage()
                 self.chart.days = data["days"] as? [[String: Any]] ?? []
                 let providers = data["providers_month"] as? [String: [String: Any]] ?? [:]
                 let text = providers.keys.sorted().map { key -> String in
@@ -882,8 +912,64 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { self.exportPreview(to: path) }
                 }
             case .failure(let error):
+                self.renderModelUsage()
                 self.providerBreakdown.stringValue = "Usage unavailable: \(error.localizedDescription)"
             }
+        }
+    }
+
+    @objc func modelPeriodChanged() { renderModelUsage() }
+
+    func renderModelUsage(loading: Bool = false) {
+        modelRows.arrangedSubviews.forEach { modelRows.removeArrangedSubview($0); $0.removeFromSuperview() }
+        let keys = ["today", "week", "month", "all"]
+        let period = keys[max(0, min(modelPeriod.selectedSegment, 3))]
+        let models = modelUsage[period] ?? [:]
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        func number(_ value: Any?) -> String { formatter.string(from: (value as? NSNumber) ?? 0) ?? "0" }
+        func row(_ values: [String], heading: Bool = false) -> NSView {
+            let result = NSView()
+            result.translatesAutoresizingMaskIntoConstraints = false
+            result.heightAnchor.constraint(equalToConstant: 22).isActive = true
+            var cells: [NSTextField] = []
+            for (index, value) in values.enumerated() {
+                let cell = label(value, size: heading ? 10 : 11, weight: heading ? .semibold : .regular, color: heading ? .secondaryLabelColor : .labelColor)
+                cell.translatesAutoresizingMaskIntoConstraints = false
+                cell.alignment = index == 0 ? .left : .right
+                cell.maximumNumberOfLines = 1
+                cell.lineBreakMode = .byTruncatingMiddle
+                cell.toolTip = index == 2 && heading ? "Cached tokens are included in input tokens." : value
+                if !heading && index > 0 { cell.font = .monospacedDigitSystemFont(ofSize: 11, weight: index == 4 ? .semibold : .regular) }
+                result.addSubview(cell)
+                cell.centerYAnchor.constraint(equalTo: result.centerYAnchor).isActive = true
+                if index == 0 {
+                    cell.leadingAnchor.constraint(equalTo: result.leadingAnchor).isActive = true
+                    cell.widthAnchor.constraint(equalTo: result.widthAnchor, multiplier: 0.30).isActive = true
+                } else {
+                    cell.leadingAnchor.constraint(equalTo: cells[index - 1].trailingAnchor, constant: 14).isActive = true
+                    if index > 1 { cell.widthAnchor.constraint(equalTo: cells[1].widthAnchor).isActive = true }
+                }
+                cells.append(cell)
+            }
+            cells.last!.trailingAnchor.constraint(equalTo: result.trailingAnchor).isActive = true
+            return result
+        }
+        let header = row(["MODEL", "INPUT", "CACHED", "OUTPUT", "TOTAL", "REQUESTS"], heading: true)
+        modelRows.addArrangedSubview(header)
+        header.widthAnchor.constraint(equalTo: modelRows.widthAnchor).isActive = true
+        if models.isEmpty {
+            modelRows.addArrangedSubview(label(loading ? "Loading…" : "No usage in this period", size: 12, color: .secondaryLabelColor))
+        }
+        for model in models.keys.sorted(by: {
+            let a = (models[$0]?["total"] as? NSNumber)?.int64Value ?? 0
+            let b = (models[$1]?["total"] as? NSNumber)?.int64Value ?? 0
+            return a == b ? $0 < $1 : a > b
+        }) {
+            let totals = models[model] ?? [:]
+            let cells = row([model == "unknown" ? "Unknown model" : model] + ["input", "cached", "output", "total", "requests"].map { number(totals[$0]) })
+            modelRows.addArrangedSubview(cells)
+            cells.widthAnchor.constraint(equalTo: modelRows.widthAnchor).isActive = true
         }
     }
 

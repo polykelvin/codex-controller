@@ -1,6 +1,7 @@
 import datetime as dt
 import importlib.util
 import json
+import sqlite3
 from pathlib import Path
 import tempfile
 import unittest
@@ -155,6 +156,40 @@ class UsageTests(unittest.TestCase):
         self.assertEqual(result["periods"]["all"]["cached"], 50)
         self.assertEqual(result["periods"]["all"]["requests"], 1)
 
+    def test_model_breakdown_tracks_model_changes_and_matches_period_totals(self):
+        today = dt.datetime.now(dt.timezone(dt.timedelta(hours=8))).date()
+        rows = [event("session_meta", {"model_provider": "openai"})]
+        for index, age in enumerate([0, 1, 8, 40]):
+            stamp = (today - dt.timedelta(days=age)).isoformat() + "T04:00:00Z"
+            rows += [event("turn_context", {"model": "model-a" if index % 2 == 0 else "model-b"}, stamp),
+                     event("token_usage_record", {"response_id": str(index), "usage": usage(100 * (index + 1))}, stamp)]
+        self.write("models.jsonl", rows)
+        self.write("fork.jsonl", rows)
+        result = self.controller.usage("personal")
+        self.assertEqual(result["models"]["today"]["model-a"]["total"], 110)
+        self.assertEqual(result["models"]["all"]["model-a"]["total"], 420)
+        self.assertEqual(result["models"]["all"]["model-b"]["total"], 620)
+        for period, totals in result["periods"].items():
+            for key in totals:
+                self.assertEqual(sum(m[key] for m in result["models"][period].values()), totals[key])
+
+    def test_models_respect_profile_filter_and_keep_unknown_metadata(self):
+        for provider in ["openai", "company_azure"]:
+            self.write(provider + ".jsonl", [event("session_meta", {"model_provider": provider}),
+                event("token_usage_record", {"response_id": provider + "-unknown", "usage": usage(50)}),
+                event("turn_context", {"model": "same-model"}),
+                event("token_usage_record", {"response_id": provider, "usage": usage(100)})])
+        personal = self.controller.usage("personal")["models"]["all"]
+        self.assertEqual(personal["unknown"]["total"], 60)
+        self.assertEqual(personal["same-model"]["requests"], 1)
+        combined = self.controller.usage()["models"]["all"]
+        self.assertEqual(combined["same-model"]["requests"], 2)
+        self.assertEqual(combined["same-model"]["cached"], 100)
+
+        self.write("legacy.jsonl", [event("turn_context", {"model": "legacy-model"}),
+            event("event_msg", {"type": "token_count", "info": {"total_token_usage": usage(100), "last_token_usage": usage(100)}})])
+        self.assertEqual(self.controller.usage()["models"]["all"]["legacy-model"]["total"], 110)
+
     def test_legacy_cumulative_counters_are_not_summed(self):
         records = [event("session_meta", {"id": "old", "model_provider": "company_azure"})]
         for n in [100, 100, 200]:
@@ -298,6 +333,38 @@ class ActivityTests(unittest.TestCase):
         self.assertEqual(data["sessions"][0]["title"], "personal")
         self.assertEqual(data["events"][0]["title"], "Started")
         with self.assertRaises(ValueError): self.controller.activity("personal", "../../auth.json")
+
+    def test_activity_uses_latest_saved_name_and_database_fallback(self):
+        home = self.root / "codex"
+        database = home / "state_5.sqlite"
+        with sqlite3.connect(database) as connection:
+            connection.execute("CREATE TABLE threads (id TEXT, title TEXT, name TEXT)")
+            connection.executemany("INSERT INTO threads VALUES (?, ?, ?)", [
+                ("one", "Generated title", "Renamed in desktop"),
+                ("two", "Database title", None)])
+        before = database.read_bytes()
+        (home / "session_index.jsonl").write_text(
+            json.dumps({"id": "one", "thread_name": "Latest name", "updated_at": "2026-11-17"}) + "\n" +
+            '{incomplete}\n' +
+            json.dumps({"id": "one", "thread_name": "Older name", "updated_at": "2026-11-16"}) + "\n")
+        for identity in ["one", "two"]:
+            self.write(identity + ".jsonl", [event("session_meta", {"id": identity}),
+                event("event_msg", {"type": "user_message", "message": "First prompt"})])
+        titles = {r["thread_id"]: r["title"] for r in self.controller.activity()["sessions"]}
+        self.assertEqual(titles, {"one": "Latest name", "two": "Database title"})
+        self.assertEqual(database.read_bytes(), before)
+        self.assertFalse(self.controller.state.exists())
+        (home / "session_index.jsonl").unlink()
+        self.assertEqual(c.read_session_titles(home)["one"], "Renamed in desktop")
+
+    def test_title_fallback_survives_unavailable_metadata(self):
+        (self.root / "codex/state_5.sqlite").write_bytes(b"invalid database")
+        self.write("message.jsonl", [event("session_meta", {"id": "message"}),
+            event("response_item", {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Find my conversation"}]})])
+        self.write("empty.jsonl", [event("session_meta", {"id": "empty-12345678"})])
+        titles = {r["thread_id"]: r["title"] for r in self.controller.activity()["sessions"]}
+        self.assertEqual(titles["message"], "Find my conversation")
+        self.assertEqual(titles["empty-12345678"], "Session empty-12")
 
     def test_activity_does_not_persist_content(self):
         self.write("one.jsonl", [event("response_item", {"type": "function_call_output", "output": "LOCAL_ONLY_CONTENT"})])
